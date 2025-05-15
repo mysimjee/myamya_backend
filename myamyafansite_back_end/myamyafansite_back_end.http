@@ -1,0 +1,6 @@
+@myamyafansite_back_end_HostAddress = http://localhost:5238
+
+GET {{myamyafansite_back_end_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
