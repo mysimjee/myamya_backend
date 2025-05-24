@@ -9,11 +9,6 @@ using myamyafansite_back_end.Database;
 
 var builder = WebApplication.CreateBuilder(args);
 
-builder.WebHost.ConfigureKestrel(options =>
-{
-    options.ListenAnyIP(5000); // No HTTPS
-});
-
 
 
 // Remove payload limit
