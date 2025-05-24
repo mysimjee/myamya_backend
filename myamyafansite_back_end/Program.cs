@@ -87,99 +87,109 @@ app.MapGet("/weatherforecast", () =>
 
 app.MapPost("/upload-video", async (HttpRequest request, [FromForm] UploadVideoForm model, IWebHostEnvironment env) =>
 {
-    var file = model.UploadedVideo;
-
-    if (file.Length == 0)
-        return Results.BadRequest("No file uploaded.");
-
-    var uploadPath = Path.Combine(env.WebRootPath, "uploads");
-    Directory.CreateDirectory(uploadPath);
-
-    var hlsOutputPath = Path.Combine(env.WebRootPath, "hls");
-    Directory.CreateDirectory(hlsOutputPath);
-
-    var fileName = Path.GetFileNameWithoutExtension(file.FileName) + Path.GetExtension(file.FileName);
-    var inputFilePath = Path.Combine(uploadPath, fileName);
-
-    await using (var stream = new FileStream(inputFilePath, FileMode.Create))
+    try
     {
-        await file.CopyToAsync(stream);
-    }
+        var file = model.UploadedVideo;
 
-    var hlsFolderName = Path.GetFileNameWithoutExtension(fileName);
-    var outputFolder = Path.Combine(hlsOutputPath, hlsFolderName);
-    Directory.CreateDirectory(outputFolder);
+        if (file == null || file.Length == 0)
+            return Results.BadRequest("No file uploaded.");
 
-    // Create variant streams
-    var variants = new[]
-    {
-        new { Bitrate = "500k", Width = 640, Height = 360 },
-        new { Bitrate = "1000k", Width = 854, Height = 480 },
-        new { Bitrate = "1500k", Width = 1280, Height = 720 }
-    };
+        var uploadPath = Path.Combine(env.WebRootPath, "uploads");
+        Directory.CreateDirectory(uploadPath);
 
-    var variantTasks = variants.Select(async variant =>
-    {
-        var variantName = $"{variant.Height}p";
-        var variantFolder = Path.Combine(outputFolder, variantName);
-        Directory.CreateDirectory(variantFolder);
+        var hlsOutputPath = Path.Combine(env.WebRootPath, "hls");
+        Directory.CreateDirectory(hlsOutputPath);
 
-        var variantPlaylistPath = Path.Combine(variantFolder, "index.m3u8");
+        var fileName = Path.GetFileNameWithoutExtension(file.FileName) + Path.GetExtension(file.FileName);
+        var inputFilePath = Path.Combine(uploadPath, fileName);
 
-        var args = $"-i \"{inputFilePath}\" " +
-                   $"-vf scale={variant.Width}:{variant.Height} " +
-                   $"-c:a aac -ar 48000 -c:v h264 -profile:v main -crf 20 -sc_threshold 0 " +
-                   $"-g 48 -keyint_min 48 -b:v {variant.Bitrate} -maxrate {variant.Bitrate} -bufsize 1000k " +
-                   $"-hls_time 10 -hls_playlist_type vod -hls_segment_filename \"{variantFolder}/segment_%03d.ts\" " +
-                   $"\"{variantPlaylistPath}\"";
-
-        var process = new Process
+        await using (var stream = new FileStream(inputFilePath, FileMode.Create))
         {
-            StartInfo = new ProcessStartInfo
-            {
-                FileName = "ffmpeg",
-                Arguments = args,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            }
-        };
-
-        process.Start();
-        var err = await process.StandardError.ReadToEndAsync();
-        await process.WaitForExitAsync();
-
-        if (process.ExitCode != 0)
-        {
-            throw new Exception($"FFmpeg failed for {variantName}: {err}");
+            await file.CopyToAsync(stream);
         }
 
-        return new
+        var hlsFolderName = Path.GetFileNameWithoutExtension(fileName);
+        var outputFolder = Path.Combine(hlsOutputPath, hlsFolderName);
+        Directory.CreateDirectory(outputFolder);
+
+        // Create variant streams
+        var variants = new[]
         {
-            Resolution = variant.Height,
-            Path = $"/hls/{hlsFolderName}/{variantName}/index.m3u8",
-            Bandwidth = int.Parse(variant.Bitrate.Replace("k", "")) * 1000
+            new { Bitrate = "500k", Width = 640, Height = 360 },
+            new { Bitrate = "1000k", Width = 854, Height = 480 },
+            new { Bitrate = "1500k", Width = 1280, Height = 720 }
         };
-    });
 
-    var results = await Task.WhenAll(variantTasks);
+        var variantTasks = variants.Select(async variant =>
+        {
+            var variantName = $"{variant.Height}p";
+            var variantFolder = Path.Combine(outputFolder, variantName);
+            Directory.CreateDirectory(variantFolder);
 
-    // Create master playlist
-    var masterPlaylistPath = Path.Combine(outputFolder, "master.m3u8");
-    await using var masterWriter = new StreamWriter(masterPlaylistPath);
+            var variantPlaylistPath = Path.Combine(variantFolder, "index.m3u8");
 
-    masterWriter.WriteLine("#EXTM3U");
+            var args = $"-i \"{inputFilePath}\" " +
+                       $"-vf scale={variant.Width}:{variant.Height} " +
+                       $"-c:a aac -ar 48000 -c:v h264 -profile:v main -crf 20 -sc_threshold 0 " +
+                       $"-g 48 -keyint_min 48 -b:v {variant.Bitrate} -maxrate {variant.Bitrate} -bufsize 1000k " +
+                       $"-hls_time 10 -hls_playlist_type vod -hls_segment_filename \"{variantFolder}/segment_%03d.ts\" " +
+                       $"\"{variantPlaylistPath}\"";
 
-    foreach (var stream in results)
-    {
-        masterWriter.WriteLine($"#EXT-X-STREAM-INF:BANDWIDTH={stream.Bandwidth},RESOLUTION={stream.Resolution}x{(stream.Resolution * 16 / 9)}");
-        masterWriter.WriteLine($"./{stream.Resolution}p/index.m3u8");
+            var process = new Process
+            {
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = "ffmpeg", // Consider using full path here on server
+                    Arguments = args,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                }
+            };
+
+            process.Start();
+            var err = await process.StandardError.ReadToEndAsync();
+            await process.WaitForExitAsync();
+
+            if (process.ExitCode != 0)
+            {
+                throw new Exception($"FFmpeg failed for {variantName}: {err}");
+            }
+
+            return new
+            {
+                Resolution = variant.Height,
+                Path = $"/hls/{hlsFolderName}/{variantName}/index.m3u8",
+                Bandwidth = int.Parse(variant.Bitrate.Replace("k", "")) * 1000
+            };
+        });
+
+        var results = await Task.WhenAll(variantTasks);
+
+        // Create master playlist
+        var masterPlaylistPath = Path.Combine(outputFolder, "master.m3u8");
+        await using var masterWriter = new StreamWriter(masterPlaylistPath);
+
+        masterWriter.WriteLine("#EXTM3U");
+
+        foreach (var stream in results)
+        {
+            masterWriter.WriteLine($"#EXT-X-STREAM-INF:BANDWIDTH={stream.Bandwidth},RESOLUTION={stream.Resolution}x{(stream.Resolution * 16 / 9)}");
+            masterWriter.WriteLine($"./{stream.Resolution}p/index.m3u8");
+        }
+
+        var playlistUrl = $"/hls/{hlsFolderName}/master.m3u8";
+        return Results.Ok(new { url = playlistUrl });
     }
-
-    var playlistUrl = $"/hls/{hlsFolderName}/master.m3u8";
-    return Results.Ok(new { url = playlistUrl });
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Upload failed: {ex.Message}");
+        Console.WriteLine(ex.StackTrace);
+        return Results.Problem(detail: ex.Message, statusCode: 500);
+    }
 }).DisableAntiforgery();
+
 
 
 string GetContentType(string filename)
