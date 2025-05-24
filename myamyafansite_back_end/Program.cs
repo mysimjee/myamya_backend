@@ -1,11 +1,16 @@
 using System.Diagnostics;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.FileProviders;
 using Microsoft.OpenApi.Models;
 using myamyafansite_back_end.Database;
 
 var builder = WebApplication.CreateBuilder(args);
+
+
+
 // Remove payload limit
 builder.Services.Configure<FormOptions>(options =>
 {
@@ -38,7 +43,8 @@ builder.Services.AddSwaggerGen(setup =>
 
 
 var app = builder.Build();
-app.UseStaticFiles();
+
+
 
 // Configure the HTTP request pipeline.
 if (app.Environment.IsDevelopment())
@@ -71,11 +77,13 @@ app.MapGet("/weatherforecast", () =>
     })
     .WithName("GetWeatherForecast");
 
+
+
 app.MapPost("/upload-video", async (HttpRequest request, [FromForm] UploadVideoForm model, IWebHostEnvironment env) =>
 {
     var file = model.UploadedVideo;
 
-    if (file == null || file.Length == 0)
+    if (file.Length == 0)
         return Results.BadRequest("No file uploaded.");
 
     var uploadPath = Path.Combine(env.WebRootPath, "uploads");
@@ -84,10 +92,10 @@ app.MapPost("/upload-video", async (HttpRequest request, [FromForm] UploadVideoF
     var hlsOutputPath = Path.Combine(env.WebRootPath, "hls");
     Directory.CreateDirectory(hlsOutputPath);
 
-    var fileName = Path.GetFileNameWithoutExtension(Path.GetRandomFileName()) + Path.GetExtension(file.FileName);
+    var fileName = Path.GetFileNameWithoutExtension(file.FileName) + Path.GetExtension(file.FileName);
     var inputFilePath = Path.Combine(uploadPath, fileName);
 
-    using (var stream = new FileStream(inputFilePath, FileMode.Create))
+    await using (var stream = new FileStream(inputFilePath, FileMode.Create))
     {
         await file.CopyToAsync(stream);
     }
@@ -96,37 +104,106 @@ app.MapPost("/upload-video", async (HttpRequest request, [FromForm] UploadVideoF
     var outputFolder = Path.Combine(hlsOutputPath, hlsFolderName);
     Directory.CreateDirectory(outputFolder);
 
-    var outputPlaylist = Path.Combine(outputFolder, "output.m3u8");
-
-    var ffmpegArgs =
-        $"-i \"{inputFilePath}\" -codec: copy -start_number 0 -hls_time 10 -hls_list_size 0 -f hls \"{outputPlaylist}\"";
-
-    var process = new Process
+    // Create variant streams
+    var variants = new[]
     {
-        StartInfo = new ProcessStartInfo
-        {
-            FileName = "ffmpeg",
-            Arguments = ffmpegArgs,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true
-        }
+        new { Bitrate = "500k", Width = 640, Height = 360 },
+        new { Bitrate = "1000k", Width = 854, Height = 480 },
+        new { Bitrate = "1500k", Width = 1280, Height = 720 }
     };
 
-    process.Start();
-    var stdOut = await process.StandardOutput.ReadToEndAsync();
-    var stdErr = await process.StandardError.ReadToEndAsync();
-    process.WaitForExit();
-
-    if (process.ExitCode != 0)
+    var variantTasks = variants.Select(async variant =>
     {
-        return Results.InternalServerError($"FFmpeg failed: {stdErr}");
+        var variantName = $"{variant.Height}p";
+        var variantFolder = Path.Combine(outputFolder, variantName);
+        Directory.CreateDirectory(variantFolder);
+
+        var variantPlaylistPath = Path.Combine(variantFolder, "index.m3u8");
+
+        var args = $"-i \"{inputFilePath}\" " +
+                   $"-vf scale={variant.Width}:{variant.Height} " +
+                   $"-c:a aac -ar 48000 -c:v h264 -profile:v main -crf 20 -sc_threshold 0 " +
+                   $"-g 48 -keyint_min 48 -b:v {variant.Bitrate} -maxrate {variant.Bitrate} -bufsize 1000k " +
+                   $"-hls_time 10 -hls_playlist_type vod -hls_segment_filename \"{variantFolder}/segment_%03d.ts\" " +
+                   $"\"{variantPlaylistPath}\"";
+
+        var process = new Process
+        {
+            StartInfo = new ProcessStartInfo
+            {
+                FileName = "ffmpeg",
+                Arguments = args,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            }
+        };
+
+        process.Start();
+        var err = await process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync();
+
+        if (process.ExitCode != 0)
+        {
+            throw new Exception($"FFmpeg failed for {variantName}: {err}");
+        }
+
+        return new
+        {
+            Resolution = variant.Height,
+            Path = $"/hls/{hlsFolderName}/{variantName}/index.m3u8",
+            Bandwidth = int.Parse(variant.Bitrate.Replace("k", "")) * 1000
+        };
+    });
+
+    var results = await Task.WhenAll(variantTasks);
+
+    // Create master playlist
+    var masterPlaylistPath = Path.Combine(outputFolder, "master.m3u8");
+    await using var masterWriter = new StreamWriter(masterPlaylistPath);
+
+    masterWriter.WriteLine("#EXTM3U");
+
+    foreach (var stream in results)
+    {
+        masterWriter.WriteLine($"#EXT-X-STREAM-INF:BANDWIDTH={stream.Bandwidth},RESOLUTION={stream.Resolution}x{(stream.Resolution * 16 / 9)}");
+        masterWriter.WriteLine($"./{stream.Resolution}p/index.m3u8");
     }
 
-    var playlistUrl = $"/hls/{hlsFolderName}/output.m3u8";
-    return Results.Ok(new { message = "Video uploaded and converted to HLS successfully", url = playlistUrl });
+    var playlistUrl = $"/hls/{hlsFolderName}/master.m3u8";
+    return Results.Ok(new { url = playlistUrl });
 }).DisableAntiforgery();
+
+
+string GetContentType(string filename)
+{
+    var ext = Path.GetExtension(filename).ToLowerInvariant();
+    return ext switch
+    {
+        ".m3u8" => "application/vnd.apple.mpegurl",
+        ".ts" => "video/mp2t",
+        _ => "application/octet-stream"
+    };
+}
+
+
+
+
+
+app.MapGet("/api/hls/{**filePath}", (HttpContext context, string filePath) =>
+{
+    var hlsRoot = Path.Combine(builder.Environment.WebRootPath, "hls");
+    var fullPath = Path.Combine(hlsRoot, filePath);
+
+    if (!System.IO.File.Exists(fullPath))
+        return Results.NotFound("File not found.");
+
+    var contentType = GetContentType(fullPath);
+
+    var stream = new FileStream(fullPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+    return Results.Stream(stream, contentType);
+});
 
 
 app.Run();

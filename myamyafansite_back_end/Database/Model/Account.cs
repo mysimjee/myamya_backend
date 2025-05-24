@@ -22,4 +22,7 @@ public class Account
 
     [Required]
     public bool AgreeToTerms { get; set; }
+
+    public string? ProfilePicture { get; set; } = ""; // Base64-encoded image (e.g., "data:image/png;base64,...")
+
 }
